@@ -6,7 +6,7 @@ This document explains the algorithms used in `FinalCodingDataMining.ipynb`, how
 
 **The twist:** the test set contains classes the training set does not (`Obesity_Type_II` and `Obesity_Type_III`). A supervised classifier can never predict labels it didn't see in training, so the project uses a **classification-then-clustering** design: an XGBoost classifier handles the known classes, then a **two-stage KMeans clustering** splits the model's "ceiling" predictions into the missing higher classes.
 
-**Current results:** validation accuracy **0.9874** (macro F1 0.9869), known-label test accuracy **0.9630**, end-to-end full-label-set test accuracy **0.9161** (841/918). Per-class test recall: Type III 1.000, Type II 0.808, Type I 0.857 — the Type I/II boundary in stage 2 is the main remaining error source.
+**Current results:** 5-fold CV accuracy **0.9841 ± 0.0067** (tuned params: `max_depth=4, learning_rate=0.05, n_estimators=600`), known-label test accuracy **0.9663**, end-to-end full-label-set test accuracy **0.9771** (897/918). Per-class test recall: Type III 1.000, Type II 0.970, Type I 0.971, Overweight I/II 0.931 each, Insufficient/Normal ~0.98.
 
 ---
 
@@ -17,8 +17,8 @@ This document explains the algorithms used in `FinalCodingDataMining.ipynb`, how
 | 1 | **XGBoost (gradient-boosted trees)** | Primary classifier over the known training classes |
 | 2 | **BMI feature engineering** | Domain-knowledge feature (`Weight / Height²`) |
 | 3 | **Two-stage KMeans clustering override** | Splits rows predicted as `Obesity_Type_I` into Types I/II/III — recovers classes missing from training |
-| 4 | **Stratified train/validation split** | Honest model evaluation |
-| 5 | **Confidence threshold tuning** | Distinguishing confident vs. uncertain predictions |
+| 4 | **5-fold stratified CV + grid search** | Honest model evaluation and hyperparameter tuning |
+| 5 | **Confidence threshold tuning (out-of-fold)** | Distinguishing confident vs. uncertain predictions |
 | 6 | **SHAP (SHapley Additive exPlanations)** | Model explainability — *why* the model predicts what it predicts |
 
 Supporting techniques: schema/required-column checks, exploratory data summaries, native categorical encoding for XGBoost, label encoding for the target, `StandardScaler` + ordinal category codes for the clustering step.
@@ -111,33 +111,30 @@ y_all = label_encoder.fit_transform(y_all_labels)   # "Normal_Weight" -> 1, etc.
 class_names = label_encoder.classes_                # used to decode predictions later
 ```
 
-### 2.3 Stratified Validation Split
+### 2.3 Cross-Validation and Hyperparameter Tuning
 
-Before training the final model on all data, we hold out 20% of the training set to measure performance honestly. **Stratified** means each class keeps the same proportion in both splits — without it, a rare class could end up entirely in one split. The notebook wraps this in `stratified_validation_split`, which first validates that there are at least two classes and at least two rows per class (otherwise stratification is impossible), then calls:
+Model evaluation uses **5-fold stratified cross-validation** (`StratifiedKFold(n_splits=5, shuffle=True)`). **Stratified** means each class keeps the same proportion in every fold — without it, a rare class could end up entirely in one fold. A small `GridSearchCV` tunes the model over `max_depth ∈ {4, 6, 8}`, `learning_rate ∈ {0.05, 0.1}`, `n_estimators ∈ {300, 600}` (scoring: accuracy); the winner is `max_depth=4, learning_rate=0.05, n_estimators=600` at **0.9841 ± 0.0067** CV accuracy. `build_model(**BEST_PARAMS)` then carries the tuned params everywhere.
 
-```python
-train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
-```
-
-The validation model is trained on the 80% and scored on the 20% with accuracy, macro F1 (treats every class equally — important with imbalance), weighted F1, macro precision and recall, plus a classification report and confusion matrix to see *which classes get confused with which*.
+A single stratified 80/20 hold-out (via `stratified_validation_split`, which validates that every class has ≥2 rows) is kept for the visual report: accuracy, macro F1 (treats every class equally — important with imbalance), weighted F1, macro precision/recall, classification report, and a confusion matrix to see *which classes get confused with which*.
 
 ### 2.4 The KMeans Clustering Override ("classification then clustering")
 
 **The problem this solves — important exam-level insight:** a supervised classifier can only ever predict labels *it saw during training*. Here `Obesity_Type_II` and `Obesity_Type_III` are missing from the training labels, so the model labels very heavy people as `Obesity_Type_I` — the highest class it knows (the "ceiling"). No amount of tuning fixes this; it's structural.
 
-**The fix:** instead of a hard BMI rule, the notebook uses **two stages of unsupervised learning** on the ceiling rows (`two_stage_cluster_ceiling_rows`):
+**The fix:** instead of a hard BMI rule, the notebook uses **two stages of unsupervised learning** on the override rows (`two_stage_cluster_ceiling_rows`):
+
+**Entry gate:** a test row enters the override if the classifier predicted `Obesity_Type_I` (`HIGHEST_KNOWN_CLASS`) **or** its BMI ≥ 30 (`OBESITY_BMI_GATE`, the clinical obesity floor). The BMI gate catches truly-obese rows the classifier placed in a lower class, which would otherwise be unrecoverable; such rows get `prediction_source = "bmi_gate_override"` when relabeled.
 
 **Stage 1 — peel off Type III (k=3, full feature set):**
 
-1. Collect all test rows the classifier predicted as `Obesity_Type_I` (`HIGHEST_KNOWN_CLASS`).
-2. Build a numeric matrix from the full classifier feature set plus BMI (`CLUSTER_FEATURES`) — categorical columns are converted to their ordinal category codes, NaNs imputed with column means, everything standardized with `StandardScaler` (KMeans is distance-based, so features must be on comparable scales), and the standardized **BMI column is multiplied by `BMI_WEIGHT = 1.5`** so BMI dominates the geometry slightly.
-3. Run `KMeans(n_clusters=3, n_init=10, random_state=RANDOM_STATE)` and sort the clusters by **ascending mean BMI**.
-4. **Only the highest-mean-BMI cluster is kept** from this stage: its rows become `Obesity_Type_III` with `prediction_source = "clustering_override"`. The other two clusters are *not* trusted for the I/II split.
+1. Build a numeric matrix from the full classifier feature set plus BMI (`CLUSTER_FEATURES`) — categorical columns are converted to their ordinal category codes, NaNs imputed with column means, everything standardized with `StandardScaler` (KMeans is distance-based, so features must be on comparable scales), and the standardized **BMI column multiplied by `BMI_WEIGHT`** so BMI dominates the geometry slightly. The weight is chosen by a **sensitivity sweep** over {1.0, 1.25, 1.5, 2.0, 3.0}, selected by clinical-rule agreement (currently 1.25).
+2. Run `KMeans(n_clusters=3, n_init=10, random_state=RANDOM_STATE)` and sort the clusters by **ascending mean BMI**.
+3. **Only the highest-mean-BMI cluster is kept** from this stage: its rows become `Obesity_Type_III` with `prediction_source = "clustering_override"`. The other two clusters are *not* trusted for the I/II split.
 
-**Stage 2 — split Type I vs Type II (k=2, BMI-dominant features):**
+**Stage 2 — split Type I vs Type II (k=2, BMI only):**
 
-5. Re-cluster the remaining ceiling rows with `KMeans(n_clusters=2)` using only `BMI_CLUSTER_FEATURES = ["BMI", "Weight", "Height"]` (BMI weight 1.0). The I/II/III boundaries are clinically defined by BMI alone, so only body-size features enter this geometry.
-6. The cluster with the **lower mean BMI** stays `Obesity_Type_I`; the other becomes `Obesity_Type_II` with `prediction_source = "clustering_override_stage2"`.
+4. Re-cluster the remaining rows on **BMI alone** (`BMI_ONLY_FEATURES`) — the I/II/III boundaries are clinically defined by BMI, so other features only add noise to this 1-D boundary. Two variants are run: **1-D KMeans (k=2)** and a **2-component Gaussian mixture**; the winner is selected by **agreement with the clinical 35/40 BMI rule** — an unsupervised criterion that uses no test labels (currently KMeans wins, 90.6% vs 87.3% agreement).
+5. The cluster with the **lower mean BMI** stays `Obesity_Type_I`; the other becomes `Obesity_Type_II` with `prediction_source = "clustering_override_stage2"`.
 
 ```python
 stage1_map = {
@@ -147,7 +144,7 @@ stage1_map = {
 }
 ```
 
-If fewer ceiling rows exist than clusters, the override is skipped with a warning (and stage 2 is skipped if fewer than 2 rows remain). Each stage prints a cluster → class mapping with the min/mean/max BMI per cluster, so the split is inspectable. Every prediction is tagged with a `prediction_source` (`classifier`, `classifier_low_confidence`, `clustering_override`, or `clustering_override_stage2`) so the export is fully auditable — you can always see *which mechanism* produced each label. This hybrid "supervised model + unsupervised post-processing" design is the project's namesake.
+If fewer override rows exist than clusters, the override is skipped with a warning (and stage 2 is skipped if fewer than 2 rows remain). Each stage prints a cluster → class mapping with the min/mean/max BMI per cluster, so the split is inspectable. Every prediction is tagged with a `prediction_source` (`classifier`, `classifier_low_confidence`, `clustering_override`, `clustering_override_stage2`, or `bmi_gate_override`) so the export is fully auditable — you can always see *which mechanism* produced each label. This hybrid "supervised model + unsupervised post-processing" design is the project's namesake.
 
 **Why two stages?** A single k=3 clustering must separate I, II, and III simultaneously in the full feature space, where lifestyle features can blur the BMI boundaries. Splitting the problem lets stage 1 isolate the most distinctive group (Type III, very high BMI) with rich features, then stage 2 draw the harder I-vs-II line using only the clinically relevant body-size variables.
 
@@ -157,18 +154,15 @@ If fewer ceiling rows exist than clusters, the override is skipped with a warnin
 
 ### 2.5 Confidence Threshold Tuning
 
-`predict_proba` gives a probability per class; the maximum is the model's *confidence*. We search thresholds 0.50–0.97 on the validation set and pick the one maximizing accuracy *among confident predictions*, while requiring at least 60% of rows to stay above the threshold (coverage):
+`predict_proba` gives a probability per class; the maximum is the model's *confidence*. The threshold is tuned on **out-of-fold probabilities** (`cross_val_predict` with the 5-fold splitter — every training row is scored by a model that never saw it), with an explicit objective: search 0.50–0.97 and pick the threshold maximizing accuracy *among confident predictions*, subject to keeping at least **95% coverage**:
 
 ```python
-for threshold in np.round(np.arange(0.50, 0.971, 0.01), 2):
-    confident = confidence >= threshold
-    coverage = confident.mean()                       # fraction of rows kept
-    confident_accuracy = accuracy_score(y_true[confident], predicted[confident])
-    ...
-candidates = threshold_df[threshold_df["coverage"] >= min_coverage]
+oof_proba = cross_val_predict(build_model(**BEST_PARAMS), X_full_xgb, y_all,
+                              cv=skf, method="predict_proba")
+candidates = threshold_df[threshold_df["coverage"] >= min_coverage]   # 0.95
 ```
 
-Ties are broken by confident macro F1, then coverage, then the lower threshold. If no threshold meets the coverage floor, the best-accuracy threshold is used regardless. The trade-off: a higher threshold means the kept predictions are more accurate, but fewer rows qualify. The chosen threshold only labels rows as `classifier_low_confidence` in the output — useful metadata for anyone consuming the predictions.
+Ties are broken by confident macro F1, then the lower threshold. If no threshold meets the coverage floor, the best-accuracy threshold is used regardless. The trade-off: a higher threshold means the kept predictions are more accurate, but fewer rows qualify. The chosen threshold only labels rows as `classifier_low_confidence` in the output — useful metadata for anyone consuming the predictions.
 
 ### 2.6 Test-Set Evaluation (two stages)
 
@@ -225,7 +219,7 @@ Predicted label: `Obesity_Type_I`, confidence = 0.92. Note the model **cannot** 
 
 **Step 4 — Confidence check.** Suppose the tuned threshold is 0.74. Since 0.92 ≥ 0.74, the row is provisionally tagged `classifier`.
 
-**Step 5 — Clustering override.** The row was predicted `Obesity_Type_I`, so it joins the ceiling group. In **stage 1**, its features (plus BMI ≈ 41.9 × 1.5 weighting, one of the highest) are standardized and clustered with k=3; KMeans places it in the highest-mean-BMI cluster, which maps to `Obesity_Type_III`. The label is replaced and the source becomes `clustering_override`. (Had it landed in one of the two lower clusters instead, **stage 2** would re-cluster it with k=2 on BMI/Weight/Height to decide between Type I and Type II — Type II rows get source `clustering_override_stage2`.)
+**Step 5 — Clustering override.** The row was predicted `Obesity_Type_I` (and its BMI ≥ 30 would have qualified it via the gate anyway), so it joins the override group. In **stage 1**, its features (with the standardized BMI column up-weighted) are standardized and clustered with k=3; KMeans places it in the highest-mean-BMI cluster, which maps to `Obesity_Type_III`. The label is replaced and the source becomes `clustering_override`. (Had it landed in one of the two lower clusters instead, **stage 2** would re-cluster it on BMI alone — 1-D KMeans vs GMM, winner picked by clinical-rule agreement — to decide between Type I and Type II; Type II rows get source `clustering_override_stage2`.)
 
 **Step 6 — Export.** The row in `obesity_predictions.csv` looks like:
 
@@ -243,7 +237,7 @@ Predicted label: `Obesity_Type_I`, confidence = 0.92. Note the model **cannot** 
 2. **Fit encoders/category levels on training data only**, then reuse them on test data — otherwise codes silently misalign.
 3. **Stratify** validation splits when classes are imbalanced.
 4. **Scale features before KMeans.** KMeans is distance-based; unscaled features (Weight in kg vs. binary categories) would dominate the geometry.
-5. **Tag every prediction's source** (`classifier` / `classifier_low_confidence` / `clustering_override` / `clustering_override_stage2`) so a hybrid system stays auditable.
+5. **Tag every prediction's source** (`classifier` / `classifier_low_confidence` / `clustering_override` / `clustering_override_stage2` / `bmi_gate_override`) so a hybrid system stays auditable.
 6. **Confidence ≠ correctness** (the model was 92% sure of a wrong label in the example), which is exactly why thresholds and post-processing matter.
 7. **Evaluate the system you ship, not just the model:** known-label accuracy measures the classifier; full-label-set accuracy measures the classifier *plus* the clustering override.
 8. **Explainability (SHAP) is a sanity check**: if the top features didn't make domain sense, you'd suspect data leakage or a bug.
