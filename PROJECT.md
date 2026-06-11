@@ -171,6 +171,34 @@ Unlike a pure prediction task, this test set *has* labels, so the notebook evalu
 1. **Known-label evaluation (classifier only):** rows whose true label exists in the training classes are scored with accuracy, a classification report, and a confusion matrix. Rows with the unknown Type II/III labels are excluded (and listed explicitly), since the raw classifier cannot get them right.
 2. **Full-label-set evaluation (after the clustering override):** all labeled rows are scored against the complete label set including `Obesity_Type_II` and `Obesity_Type_III`. This measures the end-to-end hybrid system — and how well the cluster→class mapping recovered the missing classes.
 
+**Known-label test results (classifier only, 297 rows — overall accuracy 0.9663):**
+
+| Class | Precision | Recall | F1-score | Support |
+|---|---|---|---|---|
+| Insufficient_Weight | 0.981 | 0.981 | 0.981 | 54 |
+| Normal_Weight | 0.966 | 0.982 | 0.974 | 57 |
+| Obesity_Type_I | 1.000 | 0.986 | 0.993 | 70 |
+| Overweight_Level_I | 0.947 | 0.931 | 0.939 | 58 |
+| Overweight_Level_II | 0.932 | 0.948 | 0.940 | 58 |
+| **accuracy** | | | **0.966** | 297 |
+| macro avg | 0.965 | 0.966 | 0.966 | 297 |
+| weighted avg | 0.966 | 0.966 | 0.966 | 297 |
+
+**Full-label-set test results (classifier + two-stage k-means override, all 918 rows — overall accuracy 0.9771):**
+
+| Class | Precision | Recall | F1-score | Support |
+|---|---|---|---|---|
+| Insufficient_Weight | 0.981 | 0.981 | 0.981 | 54 |
+| Normal_Weight | 0.966 | 0.982 | 0.974 | 57 |
+| Obesity_Type_I | 0.872 | 0.971 | 0.919 | 70 |
+| Overweight_Level_I | 0.947 | 0.931 | 0.939 | 58 |
+| Overweight_Level_II | 0.931 | 0.931 | 0.931 | 58 |
+| Obesity_Type_II | 0.997 | 0.970 | 0.983 | 297 |
+| Obesity_Type_III | 1.000 | 1.000 | 1.000 | 324 |
+| **accuracy** | | | **0.977** | 918 |
+| macro avg | 0.956 | 0.967 | 0.961 | 918 |
+| weighted avg | 0.978 | 0.977 | 0.977 | 918 |
+
 ### 2.7 SHAP Explainability
 
 SHAP assigns each feature, *for each individual prediction*, a contribution value rooted in game theory (Shapley values): how much did this feature push the prediction toward or away from each class? For tree models, `TreeExplainer` computes this exactly and fast:
